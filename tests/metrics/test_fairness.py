@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import LabelEncoder
 
 from aif360.sklearn.metrics import (
@@ -13,12 +14,14 @@ from aif360.sklearn.metrics import (
     statistical_parity_difference,
     average_odds_difference,
     average_predictive_value_difference,
+    consistency_score
 )
 
 from src.core.metrics.fairness.group.disparate_impact_ratio import DisparateImpactRatio
 from src.core.metrics.fairness.group.group_average_odds_difference import GroupAverageOddsDifference
 from src.core.metrics.fairness.group.group_average_predictive_value_difference import GroupAveragePredictiveValueDifference
 from src.core.metrics.fairness.group.group_statistical_parity_difference import GroupStatisticalParityDifference
+from src.core.metrics.fairness.individual.individual_consistency import IndividualConsistency
 
 df = pd.read_csv(
     "https://raw.githubusercontent.com/trustyai-explainability/model-collection/8aa8e2e762c6d2b41dbcbe8a0035d50aa5f58c93/bank-churn/data/train.csv",
@@ -57,6 +60,78 @@ def get_labeled_data():
     data_pred = data.copy()
     data_pred[:, -1] = y_pred.to_numpy().flatten()
     return data, data_pred
+
+
+def get_k_neighbors_function(k_value=5):
+    """Create a function that returns k nearest neighbors for a given input."""
+
+    def find_neighbors(sample, samples):
+        """Find k nearest neighbors for a given sample."""
+        if isinstance(sample, np.ndarray) and sample.ndim > 1:
+            sample = sample.flatten()
+
+        nbrs = NearestNeighbors(n_neighbors=k_value + 1, algorithm='ball_tree').fit(samples)
+        distances, indices = nbrs.kneighbors([sample])
+
+        neighbor_indices = indices[0][1:k_value + 1]
+        return samples[neighbor_indices]
+
+    return find_neighbors
+
+
+def get_processed_data(sample_size=None):
+    """Process data for testing individual consistency."""
+    categorical_features = ['Geography', 'Gender', 'Card Type', 'HasCrCard', 'IsActiveMember', 'Complain']
+    X_processed = X.copy()
+    for feature in categorical_features:
+        if feature in X_processed.columns:
+            le = LabelEncoder()
+            X_processed[feature] = le.fit_transform(X_processed[feature])
+
+    if sample_size is not None:
+        return X_processed.to_numpy()[:sample_size]
+    return X_processed.to_numpy()
+
+
+class MockPredictionProvider:
+    """Mock prediction provider for testing."""
+
+    def __init__(self, predictions):
+        self.predictions = predictions
+
+    def predict(self, x):
+        """Return prediction for input."""
+        if isinstance(x, np.ndarray) and x.ndim == 1:
+            x = x.reshape(1, -1)
+
+        result = []
+        for i in range(x.shape[0]):
+            if i < len(self.predictions):
+                result.append([self.predictions[i][0]])
+            else:
+                result.append([0])
+        return result
+
+
+class PerfectConsistencyProvider:
+    """Provider that always returns the same prediction."""
+
+    def predict(self, x):
+        if isinstance(x, np.ndarray) and x.ndim == 1:
+            x = x.reshape(1, -1)
+        return [[1] for _ in range(x.shape[0])]
+
+
+class RandomPredictionProvider:
+    """Provider that returns random predictions."""
+
+    def __init__(self, seed=42):
+        self.rng = np.random.RandomState(seed)
+
+    def predict(self, x):
+        if isinstance(x, np.ndarray) and x.ndim == 1:
+            x = x.reshape(1, -1)
+        return [[self.rng.randint(0, 2)] for _ in range(x.shape[0])]
 
 y, y_pred = truth_predict_output()
 privileged, unprivileged = get_privileged_unprivleged_split()
@@ -114,3 +189,62 @@ def test_average_predictive_value_difference():
     )
 
     assert score == approx(apvd, abs=0.2)
+
+
+def test_individual_consistency():
+    """Test individual consistency calculation using AIF360's consistency_score as ground truth."""
+    X_sample = get_processed_data(sample_size=50)
+    y_pred_sample = y_pred.iloc[:50].to_numpy()
+
+    k = 5
+    cs_score = consistency_score(X_sample, y_pred_sample.flatten())
+
+    prediction_provider = MockPredictionProvider(y_pred_sample)
+    proximity_function = get_k_neighbors_function(k)
+
+    score = IndividualConsistency.calculate(
+        proximity_function=proximity_function,
+        samples=X_sample,
+        prediction_provider=prediction_provider
+    )
+
+    assert score == approx(cs_score, abs=0.2)
+
+
+def test_individual_consistency_perfect():
+    """Test individual consistency with a perfect consistency model."""
+    X_sample = get_processed_data(sample_size=20)
+
+    perfect_predictions = np.ones(20)
+
+    cs_score = consistency_score(X_sample, perfect_predictions)
+
+    proximity_function = get_k_neighbors_function(3)
+
+    consistency = IndividualConsistency.calculate(
+        proximity_function=proximity_function,
+        samples=X_sample,
+        prediction_provider=PerfectConsistencyProvider()
+    )
+
+    assert consistency == approx(cs_score, abs=0.2)
+
+
+def test_individual_consistency_imperfect():
+    """Test individual consistency with an inconsistent model."""
+    X_sample = get_processed_data(sample_size=20)
+
+    rng = np.random.RandomState(42)
+    random_predictions = rng.randint(0, 2, size=20)
+
+    cs_score = consistency_score(X_sample, random_predictions)
+
+    proximity_function = get_k_neighbors_function(3)
+
+    consistency = IndividualConsistency.calculate(
+        proximity_function=proximity_function,
+        samples=X_sample,
+        prediction_provider=RandomPredictionProvider(seed=42)
+    )
+
+    assert consistency == approx(cs_score, abs=0.2)
